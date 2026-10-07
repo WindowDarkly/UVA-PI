@@ -122,32 +122,39 @@ NSF_FIELDS = ["id", "title", "piFirstName", "piLastName", "piEmail", "coPDPI",
 def fetch_nsf():
     url = "https://api.nsf.gov/services/v1/awards.json"
     fields = list(NSF_FIELDS)
-    rows, offset = [], 1
-    while True:
-        params = {
-            "awardeeName": "University of Virginia",
-            "expDateStart": TODAY.strftime("%m/%d/%Y"),
-            "printFields": ",".join(fields),
-            "offset": offset,
-            "rpp": 25,
-        }
-        try:
-            data = get_json("GET", url, params=params)
-        except requests.HTTPError:
-            if "dirAbbr" in fields:  # fall back if these fields aren't supported
-                fields = [f for f in fields if f not in ("dirAbbr", "divAbbr")]
-                continue
-            raise
-        batch = (data.get("response") or {}).get("award", [])
-        rows.extend(batch)
-        if offset % 250 == 1:
-            print(f"  NSF: {len(rows)}")
-        if len(batch) < 25:
+    # Quoted name = phrase match; unquoted matches any word and hits the 10k cap.
+    # Result order is not stable across pages, so re-page until every award is seen.
+    rows, total = {}, None
+    for _ in range(5):
+        offset = 0
+        while True:
+            params = {
+                "awardeeName": '"University of Virginia"',
+                "expDateStart": TODAY.strftime("%m/%d/%Y"),
+                "printFields": ",".join(fields),
+                "offset": offset,
+                "rpp": 25,
+            }
+            try:
+                data = get_json("GET", url, params=params)
+            except requests.HTTPError:
+                if "dirAbbr" in fields:  # fall back if these fields aren't supported
+                    fields = [f for f in fields if f not in ("dirAbbr", "divAbbr")]
+                    continue
+                raise
+            resp = data.get("response") or {}
+            total = (resp.get("metadata") or {}).get("totalCount", total)
+            batch = resp.get("award", [])
+            for a in batch:
+                rows[a.get("id")] = a
+            if len(batch) < 25:
+                break
+            offset += 25
+            time.sleep(0.5)
+        print(f"  NSF: {len(rows)}/{total}")
+        if total is None or len(rows) >= total:
             break
-        offset += 25
-        time.sleep(0.5)
-    print(f"  NSF: {len(rows)} total")
-    return rows
+    return list(rows.values())
 
 
 def parse_nsf(awards_raw):
@@ -200,7 +207,7 @@ def build_roster(people):
             "Agencies": ("Source", lambda s: ", ".join(sorted(set(s)))),
             "Active awards": ("Award ID", "nunique"),
             "Award IDs": ("Award ID", lambda s: "; ".join(sorted(set(map(str, s))))),
-            "Fields": ("Field", lambda s: "; ".join(sorted({x for x in s if x}))),
+            "Fields": ("Field", lambda s: "; ".join(sorted({x for x in s if isinstance(x, str) and x}))),
             "S&T": ("S&T", "max"),
         })
         .reset_index(drop=True)
